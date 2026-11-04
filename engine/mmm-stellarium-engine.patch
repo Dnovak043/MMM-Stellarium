@@ -1,0 +1,240 @@
+diff --git a/src/core.c b/src/core.c
+index e5e3f0e..f3e4348 100644
+--- a/src/core.c
++++ b/src/core.c
+@@ -187,6 +187,10 @@ static void core_set_default(void)
+     tonemapper_update(&core->tonemapper, core->tonemapper_p, 1, 1, core->lwmax);
+ 
+     core->telescope_auto = true;
++    // MMM-Stellarium: stock halo for every object type.
++    core->halo_stars = core->halo_planets = core->halo_comets =
++        core->halo_asteroids = core->halo_satellites = 7.0;
++    core->sun_halo = true;
+     core->mount_frame = FRAME_OBSERVED;
+ 
+     core->time_animation.dst_utc = NAN;
+@@ -303,7 +307,10 @@ int core_update(void)
+     observer_update(core->observer, true);
+     // Update telescope according to the fov.
+     if (core->telescope_auto)
+-        telescope_auto(&core->telescope, core->fov);
++        // MMM-Stellarium: in naked_eye mode, always simulate the human eye
++        // (the engine's 60 deg reference fov), whatever the zoom level.
++        telescope_auto(&core->telescope,
++                       core->naked_eye ? 60 * DD2R : core->fov);
+     progressbar_update();
+ 
+     // Update eye adaptation.
+@@ -1045,6 +1052,13 @@ static obj_klass_t core_klass = {
+         PROPERTY(time_animation_target, TYPE_MJD,
+                  MEMBER(core_t, time_animation.dst_utc)),
+         PROPERTY(time_speed, TYPE_FLOAT, MEMBER(core_t, time_speed)),
++        PROPERTY(naked_eye, TYPE_BOOL, MEMBER(core_t, naked_eye)),
++        PROPERTY(halo_stars, TYPE_FLOAT, MEMBER(core_t, halo_stars)),
++        PROPERTY(halo_planets, TYPE_FLOAT, MEMBER(core_t, halo_planets)),
++        PROPERTY(halo_comets, TYPE_FLOAT, MEMBER(core_t, halo_comets)),
++        PROPERTY(halo_asteroids, TYPE_FLOAT, MEMBER(core_t, halo_asteroids)),
++        PROPERTY(halo_satellites, TYPE_FLOAT, MEMBER(core_t, halo_satellites)),
++        PROPERTY(sun_halo, TYPE_BOOL, MEMBER(core_t, sun_halo)),
+         PROPERTY(y_offset, TYPE_FLOAT, MEMBER(core_t, y_offset)),
+         {}
+     }
+diff --git a/src/core.h b/src/core.h
+index b7e8c9f..4b87db7 100644
+--- a/src/core.h
++++ b/src/core.h
+@@ -87,6 +87,14 @@ struct core
+ 
+     telescope_t     telescope;
+     bool            telescope_auto; // Auto adjust telescope.
++    bool            naked_eye; // MMM-Stellarium: never simulate optics.
++    // MMM-Stellarium: point halo size ratio per object type (stock 7, 1 = none).
++    double          halo_stars;
++    double          halo_planets;
++    double          halo_comets;
++    double          halo_asteroids;
++    double          halo_satellites;
++    bool            sun_halo; // MMM-Stellarium: draw the Sun's glare image.
+     double          exposure_scale;
+ 
+     bool            flip_view_vertical;
+diff --git a/src/js/canvas.js b/src/js/canvas.js
+index d89aedb..9893a0a 100644
+--- a/src/js/canvas.js
++++ b/src/js/canvas.js
+@@ -27,17 +27,16 @@ Module.afterInit(function() {
+     // Get the device pixel ratio, falling back to 1.
+     var dpr = window.devicePixelRatio || 1;
+ 
+-    // Get the size of the canvas in CSS pixels.
+-    var rect = canvas.getBoundingClientRect();
+-
+-    var displayWidth  = rect.width;
+-    var displayHeight = rect.height;
+-    var sizeChanged = (canvas.width  !== displayWidth) ||
+-                      (canvas.height !== displayHeight);
++    // MMM-Stellarium: use the layout size, not the on-screen bounding box,
++    // so a CSS-rotated page (portrait mirrors) is not squashed.
++    var displayWidth  = canvas.clientWidth;
++    var displayHeight = canvas.clientHeight;
++    var sizeChanged = (canvas.width  !== Math.round(displayWidth * dpr)) ||
++                      (canvas.height !== Math.round(displayHeight * dpr));
+ 
+     if (sizeChanged) {
+-      canvas.width = displayWidth * dpr;
+-      canvas.height = displayHeight * dpr;
++      canvas.width = Math.round(displayWidth * dpr);
++      canvas.height = Math.round(displayHeight * dpr);
+     }
+ 
+     // TODO: manage paning and flicking here
+diff --git a/src/modules/comets.c b/src/modules/comets.c
+index 2268702..b938aa8 100644
+--- a/src/modules/comets.c
++++ b/src/modules/comets.c
+@@ -483,7 +483,11 @@ static int comet_render(obj_t *obj, const painter_t *painter)
+         .color = {255, 255, 255, luminance * 255},
+         .obj = obj,
+     };
+-    paint_2d_points(painter, 1, &point);
++    { // MMM-Stellarium: per-type halo.
++        painter_t p2 = *painter;
++        p2.points_halo = core->halo_comets;
++        paint_2d_points(&p2, 1, &point);
++    }
+ 
+     // Render name if needed.
+     if (*comet->name && (selected || (g_comets->hints_visible &&
+diff --git a/src/modules/milkyway.c b/src/modules/milkyway.c
+index 1d025d2..3092090 100644
+--- a/src/modules/milkyway.c
++++ b/src/modules/milkyway.c
+@@ -13,6 +13,7 @@ typedef struct milkyway {
+     obj_t           obj;
+     fader_t         visible;
+     hips_t          *hips;
++    double          brightness; // MMM-Stellarium: multiplier, stock 1.
+ } milkyway_t;
+ 
+ 
+@@ -20,6 +21,7 @@ static int milkyway_init(obj_t *obj, json_value *args)
+ {
+     milkyway_t *mw = (void*)obj;
+     fader_init(&mw->visible, true);
++    mw->brightness = 1.0; // MMM-Stellarium
+     return 0;
+ }
+ 
+@@ -53,7 +55,7 @@ static int milkyway_render(obj_t *obj, const painter_t *painter_)
+     // milky way becomes less visible with a full moon
+     c *= fmin(0.004 / fmax(0.000001, core->lwsky_average), 1.0);
+     c = fmax(c, 0) * 0.7;
+-    painter.color[3] *= c;
++    painter.color[3] *= c * fmax(0, mw->brightness); // MMM-Stellarium
+ 
+     if (painter.color[3] < 1./255)
+         return 0;
+@@ -86,6 +88,7 @@ static obj_klass_t milkyway_klass = {
+     .render_order = 5,
+     .attributes = (attribute_t[]) {
+         PROPERTY(visible, TYPE_BOOL, MEMBER(milkyway_t, visible.target)),
++        PROPERTY(brightness, TYPE_FLOAT, MEMBER(milkyway_t, brightness)),
+         {}
+     },
+ };
+diff --git a/src/modules/minorplanets.c b/src/modules/minorplanets.c
+index c522cab..085565a 100644
+--- a/src/modules/minorplanets.c
++++ b/src/modules/minorplanets.c
+@@ -339,7 +339,11 @@ static int mplanet_render(obj_t *obj, const painter_t *painter)
+         .color = {255, 255, 255, luminance * 255 * (1.0 - model_alpha)},
+         .obj = obj,
+     };
+-    paint_2d_points(painter, 1, &point);
++    { // MMM-Stellarium: per-type halo.
++        painter_t p2 = *painter;
++        p2.points_halo = core->halo_asteroids;
++        paint_2d_points(&p2, 1, &point);
++    }
+ 
+     // Render name if needed.
+     if (*mplanet->name && (selected || (g_mplanets->hints_visible &&
+diff --git a/src/modules/planets.c b/src/modules/planets.c
+index e19c51f..32be60a 100644
+--- a/src/modules/planets.c
++++ b/src/modules/planets.c
+@@ -1268,6 +1268,7 @@ static void planet_render(const planet_t *planet, const painter_t *painter_)
+ 
+     // Lower point halo effect for objects with large radius.
+     // (Mostly for the Sun, but also affect planets at large fov).
++    painter.points_halo = core->halo_planets; // MMM-Stellarium
+     painter.points_halo *= mix(1.0, 0.25,
+                                smoothstep(0.5, 3.0, point_r * DR2D));
+     point = (point_3d_t) {
+@@ -1291,7 +1292,7 @@ static void planet_render(const planet_t *planet, const painter_t *painter_)
+     }
+ 
+     // Render the Sun halo.
+-    if (planet->id == SUN) {
++    if (planet->id == SUN && core->sun_halo) { // MMM-Stellarium
+         // Modulate halo opacity according to sun's altitude
+         // This is ad-hoc code to be replaced when proper extinction is
+         // computed.
+diff --git a/src/modules/satellites.c b/src/modules/satellites.c
+index 94ed68c..071269f 100644
+--- a/src/modules/satellites.c
++++ b/src/modules/satellites.c
+@@ -665,6 +665,7 @@ static int satellite_render(obj_t *obj, const painter_t *painter_)
+         .color = {255, 255, 255, luminance * 255},
+         .obj = obj,
+     };
++    painter.points_halo = core->halo_satellites; // MMM-Stellarium
+     paint_2d_points(&painter, 1, &point);
+ 
+     // Render name if needed.
+diff --git a/src/modules/stars.c b/src/modules/stars.c
+index 1f86afa..49179a2 100644
+--- a/src/modules/stars.c
++++ b/src/modules/stars.c
+@@ -398,6 +398,7 @@ static int star_render(obj_t *obj, const painter_t *painter_)
+                   luminance * 255},
+         .obj = &star->obj,
+     };
++    painter.points_halo = core->halo_stars; // MMM-Stellarium
+     paint_2d_points(&painter, 1, &point);
+ 
+     star_render_name(&painter, star, FRAME_ICRF, pvo[0], p, size, color);
+@@ -705,6 +706,7 @@ static int render_visitor(stars_t *stars, survey_t *survey,
+             star_render_name(&painter, s, FRAME_ASTROM, v, p_win, size, color);
+     }
+     if (n > 0) {
++        painter.points_halo = core->halo_stars; // MMM-Stellarium
+         paint_2d_points(&painter, n, points);
+     }
+     free(points);
+diff --git a/src/render_gl.c b/src/render_gl.c
+index 847e5c2..4895eca 100644
+--- a/src/render_gl.c
++++ b/src/render_gl.c
+@@ -1170,7 +1170,9 @@ static void item_points_render(renderer_t *rend, const item_t *item)
+                     item->buf.data, GL_DYNAMIC_DRAW));
+ 
+     gl_update_uniform(shader, "u_color", item->color);
+-    core_size = 1.0 / item->points.halo;
++    // MMM-Stellarium: keep the core fading out inside the sprite (stock
++    // values never go below 1.75, so this only matters with glow off).
++    core_size = 1.0 / fmax(1.25, item->points.halo);
+     gl_update_uniform(shader, "u_core_size", core_size);
+ 
+     gl_buf_enable(&item->buf);
+@@ -1215,7 +1217,9 @@ static void item_points_3d_render(renderer_t *rend, const item_t *item)
+                     item->buf.data, GL_DYNAMIC_DRAW));
+ 
+     gl_update_uniform(shader, "u_color", item->color);
+-    core_size = 1.0 / item->points.halo;
++    // MMM-Stellarium: keep the core fading out inside the sprite (stock
++    // values never go below 1.75, so this only matters with glow off).
++    core_size = 1.0 / fmax(1.25, item->points.halo);
+     gl_update_uniform(shader, "u_core_size", core_size);
+ 
+     proj = rend_get_proj(rend, item->flags);
